@@ -1,0 +1,2692 @@
+#!/usr/bin/env python3
+"""Omarchy Task Manager — stats backend for the Quickshell KeyboardPanel."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+APP_VERSION = "0.5.5-44"
+EM_DASH = "\u2014"
+
+PREFERRED_THERMAL = (
+    "cpu0-0-top-thermal",
+    "cpu1-0-top-thermal",
+    "cpu2-0-top-thermal",
+)
+
+GPU_DEVFREQ = Path("/sys/class/devfreq/3d00000.gpu")
+_GPU_THERMAL_RE = re.compile(r"^gpuss_\d+_thermal$")
+
+FAN_BIN_PRIMARY = "/usr/local/bin/x1e-ec-tool"
+FAN_TIMEOUT = 2.0
+FAN_RPM_MAX = 8000
+
+STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "task-manager"
+PREFS_FILE = STATE_DIR / "prefs.json"
+STATS_STATE_FILE = STATE_DIR / "stats-state.json"
+
+APP_BINARY = str(Path.home() / ".local" / "bin" / "omarchy-task-manager")
+AUTOSTART_LUA = Path.home() / ".config" / "hypr" / "autostart.lua"
+AUTOSTART_BLOCK_BEGIN = "-- omarchy-task-manager begin"
+AUTOSTART_BLOCK_END = "-- omarchy-task-manager end"
+APP_ID = "art.sw.omarchy.TaskManager"
+
+DEFAULT_PREFS: dict = {
+    "start_compact": False,
+    "remember_expand": True,
+    "refresh_ms": 1000,
+    "last_compact": True,
+}
+
+LEFT_FAN_RE = re.compile(r"Left Fan:\s*(\d+)\s*RPM", re.IGNORECASE)
+RIGHT_FAN_RE = re.compile(r"Right Fan:\s*(\d+)\s*RPM", re.IGNORECASE)
+
+try:
+    PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
+except (OSError, ValueError):
+    PAGE_SIZE = 4096
+
+
+def _ensure_usage_imports() -> None:
+    """Load network/protobuf helpers only for ai-usage, not snapshot/prefs."""
+    global urllib, base64, struct
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    import base64
+    import struct
+
+
+def load_prefs() -> dict:
+    prefs = dict(DEFAULT_PREFS)
+    try:
+        data = json.loads(PREFS_FILE.read_text(encoding="utf-8"))
+        for key, default in DEFAULT_PREFS.items():
+            val = data.get(key, default)
+            if type(val) is type(default):
+                prefs[key] = val
+    except Exception:
+        pass
+    return prefs
+
+
+def save_prefs(prefs: dict) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        PREFS_FILE.write_text(json.dumps(prefs, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_stats_state() -> dict:
+    try:
+        return json.loads(STATS_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_stats_state(state: dict) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STATS_STATE_FILE.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _read_autostart_enabled() -> bool:
+    try:
+        text = AUTOSTART_LUA.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    i_begin = text.find(AUTOSTART_BLOCK_BEGIN)
+    if i_begin < 0:
+        return False
+    i_end = text.find(AUTOSTART_BLOCK_END, i_begin)
+    if i_end < 0:
+        return False
+    block = text[i_begin:i_end]
+    return bool(re.search(r"o\.launch_on_start\s*\(", block))
+
+
+def _set_autostart(enabled: bool) -> str:
+    try:
+        try:
+            text = AUTOSTART_LUA.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            text = "-- Extra autostart processes.\n"
+
+        i_begin = text.find(AUTOSTART_BLOCK_BEGIN)
+        i_end = text.find(AUTOSTART_BLOCK_END, i_begin) if i_begin >= 0 else -1
+        has_block = i_begin >= 0 and i_end >= 0
+
+        if enabled:
+            launch_line = f'o.launch_on_start("{APP_BINARY}")'
+            window_line = f'o.window("{APP_ID}", {{ float = true }})'
+            new_block = (
+                f"{AUTOSTART_BLOCK_BEGIN}\n"
+                f"{launch_line}\n"
+                f"{window_line}\n"
+                f"{AUTOSTART_BLOCK_END}\n"
+            )
+            if has_block:
+                block_inner = text[i_begin + len(AUTOSTART_BLOCK_BEGIN) : i_end]
+                _window_re = re.compile(
+                    r'o\.window\s*\(\s*["\']' + re.escape(APP_ID) + r'["\']'
+                )
+                if (
+                    re.search(r"o\.launch_on_start\s*\(", block_inner)
+                    and _window_re.search(block_inner)
+                ):
+                    return ""
+                text = text[:i_begin] + new_block + text[i_end + len(AUTOSTART_BLOCK_END) + 1 :]
+            else:
+                text = text.rstrip() + "\n\n" + new_block
+        elif has_block:
+            text = text[:i_begin] + text[i_end + len(AUTOSTART_BLOCK_END) + 1 :]
+
+        AUTOSTART_LUA.parent.mkdir(parents=True, exist_ok=True)
+        AUTOSTART_LUA.write_text(text, encoding="utf-8")
+        return ""
+    except Exception as exc:
+        return str(exc)
+
+
+def cpu_pct(prev: tuple[int, int] | None, cur: tuple[int, int]) -> float:
+    if prev is None:
+        return 0.0
+    d_busy = cur[0] - prev[0]
+    d_idle = cur[1] - prev[1]
+    total = d_busy + d_idle
+    if total <= 0:
+        return 0.0
+    return max(0.0, min(100.0, 100.0 * d_busy / total))
+
+
+def read_proc_stat() -> tuple[tuple[int, int] | None, dict[int, tuple[int, int]]]:
+    overall = None
+    cores: dict[int, tuple[int, int]] = {}
+    try:
+        with open("/proc/stat", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None, {}
+    for line in lines:
+        if not line.startswith("cpu"):
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            nums = [int(x) for x in parts[1:]]
+        except ValueError:
+            continue
+        while len(nums) < 7:
+            nums.append(0)
+        user, nice, system, idle, iowait, irq, softirq = nums[:7]
+        busy = user + nice + system + irq + softirq
+        idle_all = idle + iowait
+        sample = (busy, idle_all)
+        name = parts[0]
+        if name == "cpu":
+            overall = sample
+        elif name.startswith("cpu") and name[3:].isdigit():
+            cores[int(name[3:])] = sample
+    return overall, cores
+
+
+def read_cpu_temp() -> float | None:
+    base = Path("/sys/class/thermal")
+    try:
+        zones = list(base.iterdir())
+    except OSError:
+        return None
+    preferred: list[float] = []
+    cpu_named: list[float] = []
+    for zone in zones:
+        if not zone.name.startswith("thermal_zone"):
+            continue
+        try:
+            ztype = (zone / "type").read_text(encoding="utf-8").strip()
+            millideg = int((zone / "temp").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        celsius = millideg / 1000.0
+        if ztype in PREFERRED_THERMAL:
+            preferred.append(celsius)
+        elif ztype.startswith("cpu"):
+            cpu_named.append(celsius)
+    if preferred:
+        return max(preferred)
+    if cpu_named:
+        return max(cpu_named)
+    return None
+
+
+def read_gpu_usage() -> float | None:
+    try:
+        cur = int((GPU_DEVFREQ / "cur_freq").read_text(encoding="utf-8").strip())
+        mx = int((GPU_DEVFREQ / "max_freq").read_text(encoding="utf-8").strip())
+        if mx <= 0:
+            return None
+        return max(0.0, min(100.0, 100.0 * cur / mx))
+    except (OSError, ValueError):
+        return None
+
+
+def read_gpu_temp() -> float | None:
+    base = Path("/sys/class/hwmon")
+    try:
+        hwmons = list(base.iterdir())
+    except OSError:
+        return None
+    temps: list[float] = []
+    for hw in hwmons:
+        try:
+            name = (hw / "name").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not _GPU_THERMAL_RE.match(name):
+            continue
+        try:
+            millideg = int((hw / "temp1_input").read_text(encoding="utf-8").strip())
+            temps.append(millideg / 1000.0)
+        except (OSError, ValueError):
+            continue
+    return max(temps) if temps else None
+
+
+def read_mem_usage() -> tuple[int, int, float] | None:
+    total_kib: int | None = None
+    avail_kib: int | None = None
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    total_kib = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    avail_kib = int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    if total_kib is None or avail_kib is None or total_kib <= 0:
+        return None
+    used_kib = max(0, total_kib - avail_kib)
+    pct = max(0.0, min(100.0, 100.0 * used_kib / total_kib))
+    return used_kib, total_kib, pct
+
+
+def fmt_mem_gib_pair(used_kib: int, total_kib: int) -> str:
+    gib = 1024 * 1024
+    return f"{used_kib / gib:.1f} / {total_kib / gib:.1f} GiB"
+
+
+def read_uptime() -> float | None:
+    try:
+        with open("/proc/uptime", encoding="utf-8") as fh:
+            return float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def fmt_uptime(seconds: float) -> str:
+    total = max(0, int(seconds))
+    days = total // 86400
+    rem = total % 86400
+    hours = rem // 3600
+    minutes = (rem % 3600) // 60
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or not parts:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _run_cmd(argv: list[str]) -> str | None:
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=FAN_TIMEOUT,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    return ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+
+
+def _parse_fan_text(output: str | None) -> tuple[int | None, int | None] | None:
+    if not output:
+        return None
+    left_m = LEFT_FAN_RE.search(output)
+    right_m = RIGHT_FAN_RE.search(output)
+    if left_m is None and right_m is None:
+        return None
+    left = int(left_m.group(1)) if left_m else None
+    right = int(right_m.group(1)) if right_m else None
+    return left, right
+
+
+def _hwmon_fan_speeds() -> tuple[int | None, int | None]:
+    base = Path("/sys/class/hwmon")
+    try:
+        hwmons = sorted(base.iterdir())
+    except OSError:
+        return None, None
+    rpms: list[int] = []
+    for hw in hwmons:
+        for fan in sorted(hw.glob("fan*_input")):
+            try:
+                rpms.append(int(fan.read_text(encoding="utf-8").strip()))
+            except (OSError, ValueError):
+                continue
+    if not rpms:
+        return None, None
+    left = rpms[0]
+    right = rpms[1] if len(rpms) > 1 else None
+    return left, right
+
+
+def _fan_executable() -> str | None:
+    if Path(FAN_BIN_PRIMARY).is_file():
+        return FAN_BIN_PRIMARY
+    return shutil.which("x1e-ec-tool")
+
+
+def _fan_exec(exe: str, args: list[str]) -> str | None:
+    out = _run_cmd([exe] + args)
+    if out is not None:
+        return out
+    sudo = shutil.which("sudo")
+    if sudo:
+        out = _run_cmd([sudo, "-n", exe] + args)
+        if out is not None:
+            return out
+    return None
+
+
+def read_fan_speeds() -> tuple[int | None, int | None]:
+    exe = _fan_executable()
+    if exe:
+        parsed = _parse_fan_text(_fan_exec(exe, ["get-speed"]))
+        if parsed is not None:
+            return parsed
+    return _hwmon_fan_speeds()
+
+
+def fan_meter_fraction(rpm: int | None) -> float:
+    if rpm is None or rpm <= 0:
+        return 0.0
+    return max(0.0, min(1.0, rpm / FAN_RPM_MAX))
+
+
+def fmt_fan_meter(rpm: int | None) -> str:
+    if rpm is None:
+        return EM_DASH
+    pct = fan_meter_fraction(rpm) * 100.0
+    return f"{rpm} {pct:.0f}%"
+
+
+def fmt_bytes(num: int) -> str:
+    value = float(num)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{num} B"
+
+
+def _comm_from_stat(stat: str) -> tuple[str, list[str]] | None:
+    left = stat.find("(")
+    right = stat.rfind(")")
+    if left < 0 or right < left:
+        return None
+    comm = stat[left + 1 : right]
+    rest = stat[right + 1 :].split()
+    return comm, rest
+
+
+def _process_name(pid: int, comm: str) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return comm
+    if not raw or raw == b"\x00":
+        return comm
+    argv = [part.decode("utf-8", "replace") for part in raw.split(b"\x00") if part]
+    if not argv:
+        return comm
+    base = os.path.basename(argv[0])
+    if base.startswith("python") and len(argv) > 1 and not argv[1].startswith("-"):
+        return os.path.basename(argv[1])
+    return base or comm
+
+
+def _rss_bytes(pid: int, rest: list[str]) -> int:
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open(f"/proc/{pid}/statm", encoding="utf-8", errors="replace") as fh:
+            fields = fh.read().split()
+        if len(fields) >= 2:
+            return int(fields[1]) * PAGE_SIZE
+    except (OSError, ValueError):
+        pass
+    if len(rest) >= 22:
+        try:
+            return int(rest[21]) * PAGE_SIZE
+        except ValueError:
+            return 0
+    return 0
+
+
+def iter_processes() -> list[tuple[int, str, int, int, int]]:
+    results: list[tuple[int, str, int, int, int]] = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return results
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+                stat = fh.read()
+        except OSError:
+            continue
+        parsed = _comm_from_stat(stat)
+        if parsed is None:
+            continue
+        comm, rest = parsed
+        if len(rest) < 22:
+            continue
+        try:
+            jiffies = int(rest[11]) + int(rest[12])
+            starttime = int(rest[19])
+        except ValueError:
+            continue
+        pname = _process_name(pid, comm)
+        rss = _rss_bytes(pid, rest)
+        results.append((pid, pname, jiffies, rss, starttime))
+    return results
+
+
+def pid_alive(pid: int, starttime: int | None = None) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            stat = fh.read()
+    except OSError:
+        return False
+    if starttime is None:
+        return True
+    parsed = _comm_from_stat(stat)
+    if parsed is None:
+        return False
+    rest = parsed[1]
+    if len(rest) < 20:
+        return False
+    try:
+        return int(rest[19]) == starttime
+    except ValueError:
+        return False
+
+
+def kill_process(pid: int) -> tuple[bool, str]:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False, "Process not found"
+    except PermissionError:
+        return False, "Permission denied"
+    except OSError as exc:
+        return False, str(exc)
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return True, ""
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True, ""
+    except PermissionError:
+        return False, "Permission denied — could not SIGKILL"
+    except OSError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def build_snapshot(*, include_processes: bool = True) -> dict:
+    state = load_stats_state()
+    overall, cores = read_proc_stat()
+    prev_overall = state.get("prev_overall")
+    prev_overall_t = tuple(prev_overall) if isinstance(prev_overall, list) and len(prev_overall) == 2 else None
+    prev_cores_raw = state.get("prev_cores", {})
+    prev_cores: dict[int, tuple[int, int]] = {}
+    if isinstance(prev_cores_raw, dict):
+        for key, val in prev_cores_raw.items():
+            if isinstance(val, list) and len(val) == 2:
+                try:
+                    prev_cores[int(key)] = (int(val[0]), int(val[1]))
+                except (TypeError, ValueError):
+                    pass
+
+    cpu_pct_val = cpu_pct(prev_overall_t, overall) if overall else 0.0
+    core_rows = []
+    for idx in sorted(cores):
+        cur = cores[idx]
+        prev = prev_cores.get(idx)
+        core_rows.append({"id": idx, "pct": round(cpu_pct(prev, cur))})
+
+    gpu_usage = read_gpu_usage()
+    gpu_temp = read_gpu_temp()
+    cpu_temp = read_cpu_temp()
+    mem = read_mem_usage()
+    uptime = read_uptime()
+    fan_left, fan_right = read_fan_speeds()
+
+    prev_total = state.get("prev_total_jiffies")
+    prev_proc_raw = state.get("prev_proc", {})
+    prev_proc: dict[str, int] = {}
+    if isinstance(prev_proc_raw, dict):
+        for key, val in prev_proc_raw.items():
+            if isinstance(val, int):
+                prev_proc[str(key)] = val
+
+    processes = []
+    if overall is not None:
+        total_jiffies = overall[0] + overall[1]
+        if include_processes:
+            ncpu = max(1, len(cores))
+            d_total = (total_jiffies - prev_total) if isinstance(prev_total, int) else 0
+            next_proc: dict[str, int] = {}
+            for pid, name, jiffies, rss, starttime in iter_processes():
+                key = f"{pid}:{starttime}"
+                cpu = 0.0
+                prev = prev_proc.get(key)
+                if prev is not None and d_total > 0:
+                    cpu = max(0.0, 100.0 * (jiffies - prev) / d_total * ncpu)
+                next_proc[key] = jiffies
+                processes.append(
+                    {
+                        "pid": pid,
+                        "name": name,
+                        "cpu": round(cpu),
+                        "cpu_txt": f"{round(cpu)}",
+                        "rss": rss,
+                        "rss_txt": fmt_bytes(rss),
+                        "starttime": starttime,
+                    }
+                )
+            processes.sort(key=lambda row: (-row["cpu"], -row["rss"], row["name"].lower()))
+            state["prev_proc"] = next_proc
+        state["prev_total_jiffies"] = total_jiffies
+    else:
+        state["prev_total_jiffies"] = None
+        if include_processes:
+            state["prev_proc"] = {}
+
+    if overall is not None:
+        state["prev_overall"] = [overall[0], overall[1]]
+        state["prev_cores"] = {str(k): [v[0], v[1]] for k, v in cores.items()}
+    save_stats_state(state)
+
+    ram_block = None
+    if mem is not None:
+        used_kib, total_kib, pct = mem
+        ram_block = {
+            "pct": round(pct),
+            "detail": fmt_mem_gib_pair(used_kib, total_kib),
+        }
+
+    def fan_block(rpm: int | None) -> dict:
+        return {
+            "rpm": rpm,
+            "fraction": fan_meter_fraction(rpm),
+            "text": fmt_fan_meter(rpm),
+        }
+
+    return {
+        "version": APP_VERSION,
+        "cpu": {
+            "pct": round(cpu_pct_val),
+            "temp": None if cpu_temp is None else round(cpu_temp, 1),
+            "cores": core_rows,
+        },
+        "gpu": {
+            "pct": None if gpu_usage is None else round(gpu_usage),
+            "temp": None if gpu_temp is None else round(gpu_temp, 1),
+        },
+        "ram": ram_block,
+        "uptime": None if uptime is None else fmt_uptime(uptime),
+        "fans": {"left": fan_block(fan_left), "right": fan_block(fan_right)},
+        "processes": processes,
+    }
+
+
+def cmd_snapshot(*, include_processes: bool = True) -> int:
+    print(json.dumps(build_snapshot(include_processes=include_processes), separators=(",", ":")))
+    return 0
+
+
+def cmd_kill(pid: int) -> int:
+    ok, err = kill_process(pid)
+    if ok:
+        return 0
+    print(err, file=sys.stderr)
+    return 1
+
+
+def cmd_prefs_get() -> int:
+    print(json.dumps(load_prefs(), separators=(",", ":")))
+    return 0
+
+
+def cmd_prefs_set(key: str, value: str) -> int:
+    prefs = load_prefs()
+    if key not in DEFAULT_PREFS:
+        print(f"Unknown pref: {key}", file=sys.stderr)
+        return 1
+    default = DEFAULT_PREFS[key]
+    if isinstance(default, bool):
+        prefs[key] = value.lower() in ("1", "true", "yes", "on")
+    elif isinstance(default, int):
+        try:
+            prefs[key] = int(value)
+        except ValueError:
+            print(f"Invalid integer for {key}", file=sys.stderr)
+            return 1
+    else:
+        prefs[key] = value
+    save_prefs(prefs)
+    return 0
+
+
+def cmd_autostart_get() -> int:
+    print("true" if _read_autostart_enabled() else "false")
+    return 0
+
+
+def cmd_autostart_set(value: str) -> int:
+    enabled = value.lower() in ("1", "true", "yes", "on")
+    err = _set_autostart(enabled)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    return 0
+
+
+# ── AI agent usage (Cursor / Grok Bot / SuperGrok) ──────────────────────────
+# Part of the shared omarchy-task-manager CLI — keep ai-usage subcommands when
+# bumping pkgrel for unrelated TM / kbd / fan changes.
+
+AGENT_USAGE_IDS = ("cursor", "grokbot", "grok")
+AGENT_USAGE_NAMES = {
+    "cursor": "Cursor",
+    "grokbot": "Grok Bot",
+    "grok": "SuperGrok",
+}
+AGENT_USAGE_LEGACY_IDS: dict[str, tuple[str, ...]] = {
+    "grokbot": ("codex",),
+}
+AGENT_USAGE_COLLECTOR_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "grokbot": ("codex",),
+}
+USAGE_STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "agents" / "usage"
+USAGE_STALE_SECONDS = 300
+CURSOR_DASHBOARD_USAGE_URL = (
+    "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+)
+CURSOR_PLAN_INFO_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
+CURSOR_SAND_USAGE_URL = (
+    "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus"
+)
+CURSOR_OAUTH_TOKEN_URL = "https://api2.cursor.sh/oauth/token"
+CURSOR_OAUTH_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
+CURSOR_ACCESS_TOKEN_KEY = "cursorAuth/accessToken"
+CURSOR_REFRESH_TOKEN_KEY = "cursorAuth/refreshToken"
+CURSOR_DASHBOARD_USER_AGENT = "omarchy-task-manager/0.5.5-39"
+CURSOR_TIER_LABELS = {
+    "pro_plus": "Pro+",
+    "pro-plus": "Pro+",
+    "proplus": "Pro+",
+    "pro": "Pro",
+    "ultra": "Ultra",
+    "free": "Free",
+    "hobby": "Hobby",
+    "business": "Business",
+    "team": "Team",
+    "enterprise": "Enterprise",
+}
+USAGE_MISSING_HELP: dict[str, tuple[str, str]] = {
+    "cursor": (
+        "No Cursor usage data yet",
+        "Sign in to Cursor on this laptop (~/.local/bin/cursor) and use the IDE; "
+        "the panel reads local session state (no paid API calls from this panel).",
+    ),
+    "grokbot": (
+        "Grok Bot usage not loaded",
+        "Sign in to Grok Bot on this laptop, then refresh. "
+        "Reads local/session state only (no xAI API calls from this panel).",
+    ),
+    "grok": (
+        "SuperGrok usage not loaded",
+        "Run `grok login` on this laptop, then refresh. "
+        "Reads SuperGrok weekly Chat + Grok Build usage from grok login.",
+    ),
+}
+
+
+def _usage_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _usage_today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _usage_number(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_base_record(agent_id: str) -> dict:
+    return {
+        "schemaVersion": 1,
+        "id": agent_id,
+        "name": AGENT_USAGE_NAMES.get(agent_id, agent_id),
+        "updatedAt": _usage_now_iso(),
+        "ready": False,
+        "hasLocalStats": False,
+        "tierLabel": "",
+        "usageStatusText": "unavailable",
+        "authHelpText": "",
+        "limits": [],
+        "todayTotalTokens": 0,
+        "todayPrompts": 0,
+        "todaySessions": 0,
+        "recentDays": [],
+        "modelUsage": {},
+    }
+
+
+def _usage_record_score(record: dict | None) -> int:
+    if not record:
+        return 0
+    score = 0
+    limits = record.get("limits") if isinstance(record.get("limits"), list) else []
+    if limits:
+        score += 10 + len(limits)
+    if record.get("ready") is True:
+        score += 4
+    if record.get("hasLocalStats") is True:
+        score += 2
+    if _usage_number(record.get("todayTotalTokens")) > 0:
+        score += 1
+    if str(record.get("tierLabel") or "").strip():
+        score += 1
+    status = str(record.get("usageStatusText") or "").lower()
+    if "unavailable" in status or "not loaded" in status or status == "unavailable":
+        score -= 6
+    return score
+
+
+def _usage_load_state_file(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _usage_read_record(agent_id: str) -> dict | None:
+    candidates: list[dict] = []
+    primary = _usage_load_state_file(USAGE_STATE_DIR / f"{agent_id}.json")
+    if primary is not None:
+        candidates.append(_usage_normalize_record(agent_id, primary))
+    for legacy_id in AGENT_USAGE_LEGACY_IDS.get(agent_id, ()):
+        legacy = _usage_load_state_file(USAGE_STATE_DIR / f"{legacy_id}.json")
+        if legacy is not None:
+            candidates.append(_usage_normalize_record(agent_id, legacy, legacy_id=legacy_id))
+    if not candidates:
+        return None
+    return max(candidates, key=_usage_record_score)
+
+
+def _usage_sanitize_grokbot_text(text: str) -> str:
+    """Rewrite legacy Codex-era user-facing strings for the Grok Bot panel."""
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    out = raw
+    replacements = (
+        ("Codex limits unavailable", "Grok Bot limits unavailable"),
+        ("Codex usage unavailable", "Grok Bot usage unavailable"),
+        ("Codex usage not loaded", "Grok Bot usage not loaded"),
+        ("codex limits unavailable", "Grok Bot limits unavailable"),
+        ("codex usage unavailable", "Grok Bot usage unavailable"),
+        ("codex usage not loaded", "Grok Bot usage not loaded"),
+        ("`codex login`", "Grok Bot sign-in"),
+        ("codex login", "Grok Bot sign-in"),
+        ("usage-update codex", "usage-update grokbot"),
+        ("agent usage-update codex", "agent usage-update grokbot"),
+        ("omarchy-agent-usage-codex", "omarchy-agent-usage-grokbot"),
+    )
+    for old, new in replacements:
+        out = out.replace(old, new)
+    out = re.sub(r"\bCodex\b", "Grok Bot", out)
+    return out
+
+
+def _usage_sanitize_grokbot_record(record: dict) -> dict:
+    sanitized = dict(record)
+    for field in ("usageStatusText", "authHelpText", "name"):
+        if field in sanitized and sanitized[field] is not None:
+            sanitized[field] = _usage_sanitize_grokbot_text(str(sanitized[field]))
+    limits = sanitized.get("limits")
+    if isinstance(limits, list):
+        cleaned_limits: list[dict] = []
+        for entry in limits:
+            if not isinstance(entry, dict):
+                continue
+            item = dict(entry)
+            for key in ("label", "title", "caption"):
+                if key in item and item[key] is not None:
+                    item[key] = _usage_sanitize_grokbot_text(str(item[key]))
+            cleaned_limits.append(item)
+        sanitized["limits"] = cleaned_limits
+    return sanitized
+
+
+def _usage_normalize_record(agent_id: str, record: dict, legacy_id: str | None = None) -> dict:
+    normalized = dict(record)
+    normalized["id"] = agent_id
+    name = str(normalized.get("name") or "").strip()
+    legacy_names = {"Codex", "codex"} if agent_id == "grokbot" else set()
+    if not name or name in legacy_names or (legacy_id and name.lower() == legacy_id):
+        normalized["name"] = AGENT_USAGE_NAMES.get(agent_id, agent_id)
+    elif agent_id == "grok" and name in (
+        "Grok",
+        "Grok Build",
+        "Grok (grok build)",
+        "Grok (chat and build)",
+    ):
+        normalized["name"] = AGENT_USAGE_NAMES["grok"]
+    if agent_id == "grokbot" or legacy_id == "codex" or str(record.get("id") or "") == "codex":
+        normalized = _usage_sanitize_grokbot_record(normalized)
+        normalized["id"] = agent_id
+        normalized["name"] = AGENT_USAGE_NAMES.get(agent_id, agent_id)
+    return normalized
+
+
+def _usage_write_record(agent_id: str, record: dict) -> None:
+    try:
+        USAGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = USAGE_STATE_DIR / f".{agent_id}.{os.getpid()}.tmp"
+        payload = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+        tmp.write_text(payload + "\n", encoding="utf-8")
+        tmp.replace(USAGE_STATE_DIR / f"{agent_id}.json")
+    except Exception:
+        pass
+
+
+def _usage_collector_paths(agent_id: str) -> list[Path]:
+    names: list[str] = []
+    seen_names: set[str] = set()
+    for candidate in (agent_id, *AGENT_USAGE_COLLECTOR_FALLBACKS.get(agent_id, ())):
+        collector_name = f"omarchy-agent-usage-{candidate}"
+        if collector_name in seen_names:
+            continue
+        seen_names.add(collector_name)
+        names.append(collector_name)
+    roots = []
+    omarchy_path = os.environ.get("OMARCHY_PATH")
+    if omarchy_path:
+        roots.append(Path(omarchy_path) / "bin")
+    roots.extend(
+        [
+            Path("/usr/share/omarchy/bin"),
+            Path.home() / ".local/share/omarchy-rs/bin",
+            Path.home() / ".local/bin",
+        ]
+    )
+    paths: list[Path] = []
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            paths.append(Path(found))
+        for root in roots:
+            candidate = root / name
+            if candidate.is_file():
+                paths.append(candidate)
+    # Preserve order, drop duplicates.
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _usage_run_collector(agent_id: str) -> tuple[bool, str]:
+    errors: list[str] = []
+    for collector in _usage_collector_paths(agent_id):
+        try:
+            proc = subprocess.run(
+                [str(collector)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except Exception as exc:
+            errors.append(f"{collector.name}: {exc}")
+            continue
+        record = (proc.stdout or "").strip()
+        if proc.returncode != 0 or not record:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            snippet = detail[-1] if detail else f"exit {proc.returncode}"
+            errors.append(f"{collector.name}: {snippet}")
+            continue
+        try:
+            parsed = json.loads(record)
+        except json.JSONDecodeError as exc:
+            errors.append(f"{collector.name}: invalid JSON ({exc})")
+            continue
+        if not isinstance(parsed, dict):
+            errors.append(f"{collector.name}: unexpected record type")
+            continue
+        legacy_id = "codex" if str(parsed.get("id") or "") == "codex" else None
+        parsed = _usage_normalize_record(agent_id, parsed, legacy_id=legacy_id)
+        _usage_write_record(agent_id, parsed)
+        return True, ""
+    if not _usage_collector_paths(agent_id):
+        return False, f"omarchy-agent-usage-{agent_id} not found on PATH"
+    err = errors[-1] if errors else f"omarchy-agent-usage-{agent_id} failed"
+    if agent_id == "grokbot":
+        err = _usage_sanitize_grokbot_text(err)
+    return False, err
+
+
+def _usage_parse_updated_at(value: Any) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _usage_record_is_stale(record: dict | None) -> bool:
+    if not record:
+        return True
+    updated = _usage_parse_updated_at(record.get("updatedAt"))
+    if updated is None:
+        return True
+    return (time.time() - updated) > USAGE_STALE_SECONDS
+
+
+def _usage_jwt_is_expired(token: str) -> bool:
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return True
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        exp = payload.get("exp")
+        if exp is None:
+            return False
+        return float(exp) <= time.time()
+    except Exception:
+        return False
+
+
+def _usage_read_cursor_item(key: str) -> str:
+    for db in _usage_cursor_vscdb_paths():
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True, timeout=3)
+            conn.execute("PRAGMA query_only = ON")
+            row = conn.execute(
+                "SELECT value FROM ItemTable WHERE key = ? LIMIT 1",
+                (key,),
+            ).fetchone()
+            conn.close()
+        except Exception:
+            continue
+        if not row or row[0] is None:
+            continue
+        value = row[0]
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        token = str(value).strip()
+        if token:
+            return token
+    return ""
+
+
+def _usage_read_cursor_access_token() -> str:
+    return _usage_read_cursor_item(CURSOR_ACCESS_TOKEN_KEY)
+
+
+def _usage_cursor_refresh_access_token(refresh_token: str) -> str:
+    if not refresh_token:
+        return ""
+    body = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "client_id": CURSOR_OAUTH_CLIENT_ID,
+            "refresh_token": refresh_token,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        CURSOR_OAUTH_TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": CURSOR_DASHBOARD_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+    except Exception:
+        return ""
+    if not isinstance(payload, dict) or payload.get("shouldLogout") is True:
+        return ""
+    return str(payload.get("access_token") or "").strip()
+
+
+def _usage_cursor_bearer() -> str:
+    token = _usage_read_cursor_access_token()
+    if token and not _usage_jwt_is_expired(token):
+        return token
+    refreshed = _usage_cursor_refresh_access_token(
+        _usage_read_cursor_item(CURSOR_REFRESH_TOKEN_KEY)
+    )
+    return refreshed or token
+
+
+def _usage_cursor_http_json(url: str, token: str) -> dict | None:
+    if not token:
+        return None
+    request = urllib.request.Request(
+        url,
+        data=b"{}",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Connect-Protocol-Version": "1",
+            "User-Agent": CURSOR_DASHBOARD_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _usage_cursor_any_to_iso(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, dict):
+        seconds = value.get("seconds")
+        if seconds is None:
+            seconds = value.get("val")
+        if seconds is None:
+            return ""
+        value = seconds
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1_000_000_000_000:
+            ts /= 1000.0
+        try:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+        except (OverflowError, OSError, ValueError):
+            return ""
+    raw = str(value).strip()
+    if "T" in raw or (len(raw) >= 10 and raw[4] == "-" and raw[7] == "-"):
+        return raw
+    return ""
+
+
+def _usage_fraction_from_percent_value(value: Any) -> float | None:
+    try:
+        percent = float(value)
+    except (TypeError, ValueError):
+        return None
+    if percent != percent:
+        return None
+    if percent > 1:
+        percent /= 100.0
+    return min(1.0, max(0.0, percent))
+
+
+def _usage_cursor_settings_percent(value: Any) -> float | None:
+    """Parse Cursor Settings percent fields (1 == 1% used)."""
+    try:
+        percent = float(value)
+    except (TypeError, ValueError):
+        return None
+    if percent != percent or percent < 0:
+        return None
+    if percent == 0:
+        return 0.0
+    # Integer 1–100 from Plan & Usage, or already a 0–1 fraction.
+    if percent > 1:
+        percent /= 100.0
+    elif percent == 1:
+        percent = 0.01
+    return min(1.0, max(0.0, percent))
+
+
+def _usage_cursor_spend_fractions(plan: dict) -> tuple[float | None, float | None]:
+    auto_frac: float | None = None
+    api_frac: float | None = None
+    try:
+        limit = float(plan.get("limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0.0
+    if limit <= 0:
+        return None, None
+    try:
+        included = float(plan.get("includedSpend") or plan.get("included_spend") or 0)
+        if included >= 0:
+            auto_frac = min(1.0, max(0.0, included / limit))
+    except (TypeError, ValueError):
+        pass
+    try:
+        total = float(plan.get("totalSpend") or plan.get("total_spend") or 0)
+        included = float(plan.get("includedSpend") or plan.get("included_spend") or 0)
+        api_spend = max(0.0, total - included)
+        api_frac = min(1.0, max(0.0, api_spend / limit))
+    except (TypeError, ValueError):
+        pass
+    return auto_frac, api_frac
+
+
+def _usage_cursor_message_percent(text: Any) -> float | None:
+    found = re.findall(r"(\d+(?:\.\d+)?)%", str(text or ""))
+    if not found:
+        return None
+    return _usage_cursor_settings_percent(found[0])
+
+
+def _usage_cursor_plan_fractions(plan: dict) -> tuple[float | None, float | None]:
+    """Fallback percents from planUsage when display messages are absent."""
+    auto_frac = _usage_cursor_settings_percent(
+        plan.get("autoPercentUsed", plan.get("auto_percent_used"))
+    )
+    api_frac = _usage_cursor_settings_percent(
+        plan.get("apiPercentUsed", plan.get("api_percent_used"))
+    )
+    return auto_frac, api_frac
+
+
+def _usage_cursor_tier_label(*candidates: Any) -> str:
+    for raw in candidates:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        key = text.lower().replace(" ", "_")
+        if key in CURSOR_TIER_LABELS:
+            return CURSOR_TIER_LABELS[key]
+        for needle, label in CURSOR_TIER_LABELS.items():
+            if needle in key:
+                return label
+        if text[0].isupper():
+            return text
+    return ""
+
+
+def _usage_fetch_cursor_dashboard(token: str) -> dict | None:
+    request = urllib.request.Request(
+        CURSOR_DASHBOARD_USAGE_URL,
+        data=b"{}",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Connect-Protocol-Version": "1",
+            "User-Agent": CURSOR_DASHBOARD_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    body = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    plan = body.get("planUsage") if isinstance(body.get("planUsage"), dict) else None
+    if not isinstance(plan, dict):
+        return None
+
+    auto_frac = _usage_cursor_message_percent(
+        body.get("autoModelSelectedDisplayMessage")
+    )
+    if auto_frac is None:
+        auto_frac = _usage_cursor_message_percent(body.get("displayMessage"))
+    api_frac = _usage_cursor_message_percent(
+        body.get("namedModelSelectedDisplayMessage")
+    )
+    plan_auto, plan_api = _usage_cursor_plan_fractions(plan)
+    if auto_frac is None:
+        auto_frac = plan_auto
+    if api_frac is None:
+        api_frac = plan_api
+    reset_raw = body.get("billingCycleEnd", body.get("billing_cycle_end"))
+    reset_iso = ""
+    if reset_raw is not None and str(reset_raw).strip():
+        try:
+            if isinstance(reset_raw, (int, float)):
+                ts = float(reset_raw)
+                if ts > 1_000_000_000_000:
+                    ts /= 1000.0
+                reset_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+            else:
+                text = str(reset_raw).strip()
+                if text.endswith("Z"):
+                    reset_iso = text
+                elif text:
+                    reset_iso = text + "Z" if "T" in text else text + "T00:00:00Z"
+        except (TypeError, ValueError, OSError):
+            reset_iso = ""
+
+    limits: list[dict] = []
+    if auto_frac is not None:
+        limits.append(
+            {
+                "label": "Cursor Models",
+                "title": "Cursor Models",
+                "percent": auto_frac,
+                "resetsAt": reset_iso,
+            }
+        )
+    if api_frac is not None:
+        limits.append(
+            {
+                "label": "Other Models",
+                "title": "Other Models",
+                "percent": api_frac,
+                "resetsAt": reset_iso,
+            }
+        )
+    if not limits:
+        return None
+
+    tier = _usage_cursor_tier_label(
+        body.get("membershipType"),
+        body.get("membership_type"),
+        plan.get("membershipType"),
+        plan.get("membership_type"),
+    )
+    info_payload = _usage_cursor_http_json(CURSOR_PLAN_INFO_URL, token)
+    if isinstance(info_payload, dict):
+        info_body = (
+            info_payload.get("result")
+            if isinstance(info_payload.get("result"), dict)
+            else info_payload
+        )
+        info = info_body.get("planInfo") if isinstance(info_body.get("planInfo"), dict) else info_body
+        if isinstance(info, dict):
+            tier = _usage_cursor_tier_label(
+                info.get("planName"),
+                info.get("plan_name"),
+                info.get("membershipType"),
+                info.get("membership_type"),
+                tier,
+            ) or tier
+            if not reset_iso:
+                reset_iso = _usage_cursor_any_to_iso(
+                    info.get("billingCycleEnd", info.get("billing_cycle_end"))
+                )
+    record = _usage_base_record("cursor")
+    record.update(
+        {
+            "ready": True,
+            "hasLocalStats": False,
+            "usageStatusText": "",
+            "authHelpText": "Live Cursor dashboard quota",
+            "limits": limits,
+            "tierLabel": tier,
+            "updatedAt": _usage_now_iso(),
+        }
+    )
+    return record
+
+
+def _usage_fetch_cursor_live() -> dict | None:
+    token = _usage_cursor_bearer()
+    if not token:
+        return None
+    record = _usage_fetch_cursor_dashboard(token)
+    if record is not None:
+        return record
+    refreshed = _usage_cursor_refresh_access_token(
+        _usage_read_cursor_item(CURSOR_REFRESH_TOKEN_KEY)
+    )
+    if not refreshed or refreshed == token:
+        return None
+    return _usage_fetch_cursor_dashboard(refreshed)
+
+
+def _usage_cursor_sand_usage() -> dict | None:
+    token = _usage_cursor_bearer()
+    payload = _usage_cursor_http_json(CURSOR_SAND_USAGE_URL, token)
+    if payload is None:
+        refreshed = _usage_cursor_refresh_access_token(
+            _usage_read_cursor_item(CURSOR_REFRESH_TOKEN_KEY)
+        )
+        if refreshed:
+            payload = _usage_cursor_http_json(CURSOR_SAND_USAGE_URL, refreshed)
+    if not isinstance(payload, dict):
+        return None
+    body = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    if not isinstance(body, dict):
+        return None
+    percent = None
+    for key in (
+        "usagePercent",
+        "usage_percent",
+        "percentUsed",
+        "percent_used",
+        "includedUsagePercent",
+        "included_usage_percent",
+        "percent",
+    ):
+        percent = _usage_fraction_from_percent_value(body.get(key))
+        if percent is not None:
+            break
+    if percent is None:
+        return None
+    resets = ""
+    for key in (
+        "nextResetTimestampUtc",
+        "next_reset_timestamp_utc",
+        "nextResetAt",
+        "next_reset_at",
+        "resetAt",
+        "reset_at",
+    ):
+        resets = _usage_cursor_any_to_iso(body.get(key))
+        if resets:
+            break
+    return {"percent": percent, "resets_at": resets}
+
+
+def _usage_collect_grokbot_local() -> dict:
+    record = _usage_base_record("grokbot")
+    sand = _usage_cursor_sand_usage()
+    if sand and sand.get("percent") is not None:
+        limit = {
+            "label": "Weekly usage",
+            "title": "Weekly usage",
+            "percent": sand["percent"],
+        }
+        resets = str(sand.get("resets_at") or "").strip()
+        if resets:
+            limit["resetsAt"] = resets
+        record.update(
+            {
+                "ready": True,
+                "hasLocalStats": True,
+                "usageStatusText": "",
+                "authHelpText": "",
+                "limits": [limit],
+            }
+        )
+        return record
+    record["usageStatusText"] = "Grok Bot usage unavailable"
+    record["authHelpText"] = (
+        "Sign in to Cursor on this laptop, then refresh. "
+        "Grok Bot weekly usage comes from the Cursor spending page."
+    )
+    return record
+
+
+def _usage_merge_model_usage(left: dict, right: dict) -> dict:
+    merged = {key: dict(value) for key, value in left.items() if isinstance(value, dict)}
+    for model, bucket in right.items():
+        if not isinstance(bucket, dict):
+            continue
+        target = merged.setdefault(
+            model,
+            {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+            },
+        )
+        for field in target:
+            target[field] = _usage_number(target.get(field)) + _usage_number(bucket.get(field))
+    return merged
+
+
+def _usage_merge_records(
+    primary: dict | None,
+    secondary: dict | None,
+    *,
+    agent_id: str,
+) -> dict:
+    if primary is None and secondary is None:
+        return _usage_base_record(agent_id)
+    if primary is None:
+        return dict(secondary or _usage_base_record(agent_id))
+    if secondary is None:
+        return dict(primary)
+
+    merged = dict(primary)
+    primary_limits = primary.get("limits") if isinstance(primary.get("limits"), list) else []
+    secondary_limits = secondary.get("limits") if isinstance(secondary.get("limits"), list) else []
+    if secondary_limits and (not primary_limits or _usage_record_score(secondary) > _usage_record_score(primary)):
+        merged["limits"] = secondary_limits
+    elif primary_limits:
+        merged["limits"] = primary_limits
+
+    for field in ("tierLabel", "usageStatusText", "authHelpText"):
+        if not str(merged.get(field) or "").strip() and str(secondary.get(field) or "").strip():
+            merged[field] = secondary[field]
+
+    for field in ("todayTotalTokens", "todayPrompts", "todaySessions"):
+        merged[field] = max(_usage_number(merged.get(field)), _usage_number(secondary.get(field)))
+
+    left_models = merged.get("modelUsage") if isinstance(merged.get("modelUsage"), dict) else {}
+    right_models = secondary.get("modelUsage") if isinstance(secondary.get("modelUsage"), dict) else {}
+    if right_models:
+        merged["modelUsage"] = _usage_merge_model_usage(left_models, right_models)
+
+    merged["ready"] = bool(merged.get("ready")) or bool(secondary.get("ready"))
+    merged["hasLocalStats"] = bool(merged.get("hasLocalStats")) or bool(secondary.get("hasLocalStats"))
+
+    primary_updated = _usage_parse_updated_at(primary.get("updatedAt"))
+    secondary_updated = _usage_parse_updated_at(secondary.get("updatedAt"))
+    if secondary_updated is not None and (primary_updated is None or secondary_updated > primary_updated):
+        merged["updatedAt"] = secondary.get("updatedAt")
+    return merged
+
+
+def _usage_run_omarchy_update(agents: tuple[str, ...]) -> str:
+    omarchy = shutil.which("omarchy")
+    if not omarchy:
+        return "omarchy CLI not found"
+    args = [omarchy, "agent", "usage-update", *agents]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=180, check=False)
+    except Exception as exc:
+        return str(exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return detail.splitlines()[-1] if detail else f"omarchy agent usage-update exit {proc.returncode}"
+    return ""
+
+
+def _usage_add_tokens(
+    day: str,
+    model: str,
+    tokens: int,
+    *,
+    today: str,
+    today_tokens: int,
+    total_tokens: int,
+    model_usage: dict,
+) -> tuple[int, int]:
+    if tokens <= 0:
+        return today_tokens, total_tokens
+    total_tokens += tokens
+    if day == today:
+        today_tokens += tokens
+    bucket = model_usage.setdefault(
+        model,
+        {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+        },
+    )
+    bucket["outputTokens"] = _usage_number(bucket.get("outputTokens")) + tokens
+    return today_tokens, total_tokens
+
+
+def _usage_cursor_vscdb_paths() -> list[Path]:
+    home = Path.home()
+    candidates: list[Path] = [
+        home / ".config/Cursor/User/globalStorage/state.vscdb",
+        home / ".config/cursor/User/globalStorage/state.vscdb",
+        home / ".cursor/User/globalStorage/state.vscdb",
+        home / "snap/cursor/current/.config/Cursor/User/globalStorage/state.vscdb",
+    ]
+    for pattern in (
+        ".config/*/User/globalStorage/state.vscdb",
+        ".var/app/*/config/Cursor/User/globalStorage/state.vscdb",
+        "snap/cursor/*/.config/Cursor/User/globalStorage/state.vscdb",
+    ):
+        for path in home.glob(pattern):
+            if "ursor" in str(path).lower():
+                candidates.append(path)
+    seen: set[str] = set()
+    found: list[Path] = []
+    for path in candidates:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.is_file():
+            found.append(path)
+    return found
+
+
+def _usage_scan_cursor_vscdb(db: Path, today: str) -> tuple[int, int, int, dict]:
+    today_tokens = 0
+    total_tokens = 0
+    prompts = 0
+    model_usage: dict = {}
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True, timeout=3)
+    conn.execute("PRAGMA query_only = ON")
+    rows = conn.execute("SELECT key, value FROM ItemTable").fetchall()
+    conn.close()
+
+    token_key_re = re.compile(r"token|usage|composer", re.IGNORECASE)
+    for key, value in rows:
+        if value is None:
+            continue
+        key_s = str(key or "")
+        text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+        if not token_key_re.search(key_s) and "composer" not in text[:200].lower():
+            continue
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        candidates = [payload]
+        if isinstance(payload.get("composerData"), dict):
+            candidates.append(payload["composerData"])
+
+        for item in candidates:
+            breakdown = item.get("promptTokenBreakdown") or item.get("tokenBreakdown") or {}
+            if isinstance(breakdown, dict):
+                tokens = sum(_usage_number(v) for v in breakdown.values())
+            else:
+                tokens = _usage_number(item.get("totalTokens") or item.get("tokens"))
+            if tokens <= 0:
+                usage = item.get("usage") or {}
+                tokens = _usage_number(usage.get("totalTokens") or usage.get("total_tokens"))
+            if tokens <= 0:
+                continue
+            prompts += 1
+            model = str(item.get("model") or item.get("modelName") or "cursor")
+            today_tokens, total_tokens = _usage_add_tokens(
+                today,
+                model,
+                tokens,
+                today=today,
+                today_tokens=today_tokens,
+                total_tokens=total_tokens,
+                model_usage=model_usage,
+            )
+    return today_tokens, total_tokens, prompts, model_usage
+
+
+GROK_PROXY_BASE = "https://cli-chat-proxy.grok.com/v1"
+GROK_TOKEN_AUTH = "xai-grok-cli"
+GROK_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
+GROK_CREDITS_URL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+
+
+def _usage_grok_home() -> Path:
+    return Path(os.environ.get("GROK_HOME", str(Path.home() / ".grok")))
+
+
+def _usage_field(data: dict, *names: str):
+    for name in names:
+        if name in data and data[name] is not None:
+            return data[name]
+    return None
+
+
+def _usage_grok_auth_data() -> dict:
+    path = _usage_grok_home() / "auth.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _usage_grok_auth_creds() -> tuple[str, str]:
+    ranked: list[tuple[int, int, str, str]] = []
+    for issuer, entry in _usage_grok_auth_data().items():
+        if not isinstance(entry, dict):
+            continue
+        token = str(entry.get("key") or "").strip()
+        if not token:
+            continue
+        user_id = str(entry.get("user_id") or "").strip()
+        expired = 1 if _usage_jwt_is_expired(token) else 0
+        preferred = 0 if str(issuer).startswith("https://auth.x.ai") else 1
+        ranked.append((expired, preferred, token, user_id))
+    if not ranked:
+        return "", ""
+    ranked.sort()
+    return ranked[0][2], ranked[0][3]
+
+
+def _usage_grok_write_auth(data: dict) -> None:
+    path = _usage_grok_home() / "auth.json"
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _usage_grok_refresh_auth() -> bool:
+    """Silently refresh grok login via OIDC. Never logs tokens."""
+    data = _usage_grok_auth_data()
+    if not data:
+        return False
+    changed = False
+    for issuer, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        token = str(entry.get("key") or "").strip()
+        if token and not _usage_jwt_is_expired(token):
+            continue
+        refresh = str(entry.get("refresh_token") or "").strip()
+        if not refresh:
+            continue
+        client_id = str(
+            entry.get("oidc_client_id") or entry.get("client_id") or ""
+        ).strip()
+        issuer_s = str(issuer)
+        if not client_id and "::" in issuer_s:
+            client_id = issuer_s.split("::", 1)[1].strip()
+        if not client_id:
+            continue
+        body = urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": client_id,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            GROK_TOKEN_ENDPOINT,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        new_token = str(payload.get("access_token") or payload.get("id_token") or "").strip()
+        if not new_token:
+            continue
+        entry["key"] = new_token
+        new_refresh = str(payload.get("refresh_token") or "").strip()
+        if new_refresh:
+            entry["refresh_token"] = new_refresh
+        try:
+            expires_in = float(payload.get("expires_in") or 0)
+        except (TypeError, ValueError):
+            expires_in = 0.0
+        if expires_in > 0:
+            entry["expires_at"] = time.time() + expires_in
+        changed = True
+    if changed:
+        try:
+            _usage_grok_write_auth(data)
+        except OSError:
+            return False
+    return changed
+
+
+def _usage_grok_client_version() -> str:
+    path = _usage_grok_home() / "version.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("version") or data.get("clientVersion") or "").strip()
+
+
+def _usage_grok_proxy_json(
+    path: str,
+    surface: str = "interactive",
+    *,
+    _retried: bool = False,
+) -> dict | None:
+    token, user_id = _usage_grok_auth_creds()
+    if not token:
+        return None
+    if _usage_jwt_is_expired(token) and not _retried:
+        if _usage_grok_refresh_auth():
+            return _usage_grok_proxy_json(path, surface, _retried=True)
+    version = _usage_grok_client_version() or "1.0.13"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-XAI-Token-Auth": GROK_TOKEN_AUTH,
+        "Accept": "application/json",
+        "User-Agent": f"grok/{version}",
+        "x-grok-client-version": version,
+        "x-grok-client-mode": surface if surface in ("interactive", "headless") else "interactive",
+    }
+    if user_id:
+        headers["x-userid"] = user_id
+    req = urllib.request.Request(
+        f"{GROK_PROXY_BASE}{path}",
+        method="GET",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403) and not _retried and _usage_grok_refresh_auth():
+            return _usage_grok_proxy_json(path, surface, _retried=True)
+        return None
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _usage_supergrok_percent_value(value: Any) -> float | None:
+    """SuperGrok billing percents are 0–100 (1 == 1% used)."""
+    return _usage_cursor_settings_percent(value)
+
+
+def _usage_supergrok_product_kind(name: str) -> str:
+    key = str(name or "").lower().replace("_", "").replace(" ", "")
+    if "build" in key:
+        return "build"
+    if "chat" in key:
+        return "chat"
+    if key in ("api", "productapi"):
+        return "chat"
+    return "other"
+
+
+def _usage_supergrok_weekly_parts(config: dict) -> dict[str, float | None]:
+    """Weekly SuperGrok parts: Chat + Grok Build. Not Cursor Grok."""
+    credit = _usage_supergrok_percent_value(
+        _usage_field(config, "creditUsagePercent", "credit_usage_percent")
+    )
+    chat: float | None = None
+    build: float | None = None
+    others: list[float] = []
+    products = _usage_field(config, "productUsage", "product_usage")
+    if isinstance(products, list):
+        for item in products:
+            if not isinstance(item, dict):
+                continue
+            frac = _usage_supergrok_percent_value(
+                _usage_field(item, "usagePercent", "usage_percent", "percent")
+            )
+            if frac is None:
+                continue
+            kind = _usage_supergrok_product_kind(
+                str(_usage_field(item, "product", "name", "label") or "")
+            )
+            if kind == "build":
+                build = frac if build is None else min(1.0, build + frac)
+            elif kind == "chat":
+                chat = frac if chat is None else min(1.0, chat + frac)
+            else:
+                others.append(frac)
+    combined: float | None = None
+    if chat is not None and build is not None:
+        combined = min(1.0, max(0.0, chat + build))
+    elif others and (chat is not None or build is not None):
+        combined = min(1.0, max(0.0, sum(others) + (chat or 0.0) + (build or 0.0)))
+    return {
+        "credit": credit,
+        "chat": chat,
+        "build": build,
+        "combined": combined,
+    }
+
+
+def _usage_supergrok_weekly_fraction(config: dict) -> float | None:
+    parts = _usage_supergrok_weekly_parts(config)
+    combined = parts.get("combined")
+    credit = parts.get("credit")
+    if combined is not None and credit is not None:
+        return max(float(combined), float(credit))
+    if combined is not None:
+        return float(combined)
+    if credit is not None:
+        return float(credit)
+    chat = parts.get("chat")
+    if chat is not None:
+        return float(chat)
+    build = parts.get("build")
+    if build is not None:
+        return float(build)
+    return None
+
+
+def _usage_proto_varint(data: bytes, pos: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while pos < len(data):
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return value, pos
+        shift += 7
+        if shift > 70:
+            break
+    return value, pos
+
+
+def _usage_proto_fields(data: bytes):
+    pos = 0
+    while pos < len(data):
+        key, pos = _usage_proto_varint(data, pos)
+        number = key >> 3
+        wire = key & 0x07
+        if wire == 0:
+            value, pos = _usage_proto_varint(data, pos)
+            yield number, wire, value
+        elif wire == 1:
+            if pos + 8 > len(data):
+                return
+            yield number, wire, data[pos : pos + 8]
+            pos += 8
+        elif wire == 2:
+            length, pos = _usage_proto_varint(data, pos)
+            if pos + length > len(data):
+                return
+            yield number, wire, data[pos : pos + length]
+            pos += length
+        elif wire == 5:
+            if pos + 4 > len(data):
+                return
+            yield number, wire, data[pos : pos + 4]
+            pos += 4
+        else:
+            return
+
+
+def _usage_grpc_web_payloads(data: bytes) -> list[bytes]:
+    payloads: list[bytes] = []
+    index = 0
+    while index + 5 <= len(data):
+        flags = data[index]
+        length = int.from_bytes(data[index + 1 : index + 5], "big")
+        start = index + 5
+        end = start + length
+        if end > len(data):
+            break
+        chunk = data[start:end]
+        index = end
+        if flags & 0x80:
+            continue
+        payloads.append(chunk)
+    if not payloads and data:
+        payloads = [data]
+    return payloads
+
+
+def _usage_grok_web_credits(token: str) -> tuple[float | None, str]:
+    """Settings → Usage weekly SuperGrok percent from grok.com."""
+    if not token:
+        return None, ""
+    req = urllib.request.Request(
+        GROK_CREDITS_URL,
+        data=b"\x00\x00\x00\x00\x00",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-XAI-Token-Auth": GROK_TOKEN_AUTH,
+            "Content-Type": "application/grpc-web+proto",
+            "Accept": "application/grpc-web+proto",
+            "X-Grpc-Web": "1",
+            "Origin": "https://grok.com",
+            "Referer": "https://grok.com/",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+    except Exception:
+        return None, ""
+    percent: float | None = None
+    resets = ""
+    for payload in _usage_grpc_web_payloads(raw):
+        config = None
+        for number, wire, value in _usage_proto_fields(payload):
+            if number == 1 and wire == 2 and isinstance(value, (bytes, bytearray)):
+                config = bytes(value)
+                break
+        if config is None:
+            config = payload
+        for number, wire, value in _usage_proto_fields(config):
+            if number == 1 and wire == 5 and isinstance(value, (bytes, bytearray)) and len(value) == 4:
+                parsed = struct.unpack("<f", value)[0]
+                if parsed == parsed and 0.0 <= parsed <= 100.0:
+                    percent = _usage_supergrok_percent_value(parsed)
+            elif number in (5, 8) and wire == 2 and isinstance(value, (bytes, bytearray)):
+                period = bytes(value)
+                for pnum, pwire, pval in _usage_proto_fields(period):
+                    if pnum == 2 and pwire == 2 and isinstance(pval, (bytes, bytearray)):
+                        text = bytes(pval).decode("utf-8", errors="replace").strip()
+                        if text:
+                            resets = resets or text
+    return percent, resets
+
+
+def _usage_grok_billing_snapshot() -> dict:
+    snap = {
+        "signed_in": bool(_usage_grok_auth_creds()[0]),
+        "percent": None,
+        "resets_at": "",
+        "tier": "SuperGrok",
+    }
+    token, _user_id = _usage_grok_auth_creds()
+    if token and _usage_jwt_is_expired(token):
+        _usage_grok_refresh_auth()
+        token, _user_id = _usage_grok_auth_creds()
+    snap["signed_in"] = bool(token)
+
+    billing = None
+    product_total: float | None = None
+    credit: float | None = None
+    resets = ""
+    for surface in ("interactive", "headless"):
+        payload = _usage_grok_proxy_json("/billing?format=credits", surface=surface)
+        if not isinstance(payload, dict):
+            continue
+        if billing is None:
+            billing = payload
+        cfg = payload.get("config") if isinstance(payload.get("config"), dict) else payload
+        if not isinstance(cfg, dict):
+            continue
+        parts = _usage_supergrok_weekly_parts(cfg)
+        if parts.get("combined") is not None:
+            product_total = (
+                float(parts["combined"])
+                if product_total is None
+                else max(product_total, float(parts["combined"]))
+            )
+        if parts.get("credit") is not None:
+            credit = (
+                float(parts["credit"]) if credit is None else max(credit, float(parts["credit"]))
+            )
+        period = _usage_field(cfg, "currentPeriod", "current_period")
+        period = period if isinstance(period, dict) else {}
+        resets = resets or str(
+            _usage_field(period, "end")
+            or _usage_field(cfg, "billingPeriodEnd", "billing_period_end")
+            or ""
+        )
+
+    web_percent, web_resets = _usage_grok_web_credits(token)
+    resets = resets or web_resets
+
+    if product_total is not None:
+        percent = product_total
+        if web_percent is not None:
+            percent = max(percent, web_percent)
+        if credit is not None:
+            percent = max(percent, credit)
+    elif web_percent is not None:
+        percent = web_percent
+    else:
+        percent = credit
+
+    if percent is None and billing is None and web_percent is None:
+        return snap
+
+    tier = "SuperGrok"
+    if isinstance(billing, dict):
+        tier = str(
+            _usage_field(billing, "subscriptionTier", "subscription_tier") or ""
+        ).strip() or tier
+    settings = _usage_grok_proxy_json("/settings")
+    if isinstance(settings, dict):
+        display = str(
+            _usage_field(settings, "subscription_tier_display", "subscriptionTierDisplay")
+            or ""
+        ).strip()
+        if display:
+            tier = display
+    snap["percent"] = percent
+    snap["resets_at"] = str(resets or "")
+    snap["tier"] = tier or "SuperGrok"
+    return snap
+
+
+def _usage_collect_grok_local() -> dict:
+    record = _usage_base_record("grok")
+    grok_home = _usage_grok_home()
+    today = _usage_today()
+    today_tokens = 0
+    total_tokens = 0
+    model_usage: dict = {}
+    sessions = 0
+
+    if grok_home.is_dir():
+        for path in grok_home.glob("sessions/**/updates.jsonl"):
+            sessions += 1
+            try:
+                with path.open(encoding="utf-8", errors="replace") as handle:
+                    for raw in handle:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            entry = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if entry.get("type") != "turn_completed":
+                            continue
+                        usage = entry.get("usage") or {}
+                        tokens = _usage_number(usage.get("total_tokens"))
+                        if not tokens:
+                            tokens = (
+                                _usage_number(usage.get("input_tokens"))
+                                + _usage_number(usage.get("output_tokens"))
+                                + _usage_number(usage.get("cache_read_input_tokens"))
+                                + _usage_number(usage.get("cache_creation_input_tokens"))
+                            )
+                        if tokens <= 0:
+                            continue
+                        ts = entry.get("timestamp") or entry.get("created_at") or path.stat().st_mtime
+                        if isinstance(ts, (int, float)):
+                            if ts > 10_000_000_000:
+                                ts = ts / 1000
+                            day = time.strftime("%Y-%m-%d", time.localtime(ts))
+                        else:
+                            day = str(ts)[:10] if ts else today
+                        model = str(entry.get("model") or usage.get("model") or "grok")
+                        today_tokens, total_tokens = _usage_add_tokens(
+                            day,
+                            model,
+                            tokens,
+                            today=today,
+                            today_tokens=today_tokens,
+                            total_tokens=total_tokens,
+                            model_usage=model_usage,
+                        )
+            except OSError:
+                continue
+
+    record["todayTotalTokens"] = today_tokens
+    record["todayPrompts"] = today_tokens
+    record["todaySessions"] = sessions
+    record["modelUsage"] = model_usage
+
+    snap = _usage_grok_billing_snapshot()
+    if snap.get("tier"):
+        record["tierLabel"] = str(snap.get("tier") or "SuperGrok")
+    percent = snap.get("percent")
+    if percent is not None:
+        limit = {
+            "label": "Usage",
+            "title": "Usage",
+            "percent": percent,
+        }
+        resets = str(snap.get("resets_at") or "").strip()
+        if resets:
+            limit["resetsAt"] = resets
+        record.update(
+            {
+                "ready": True,
+                "hasLocalStats": True,
+                "usageStatusText": "",
+                "authHelpText": "",
+                "limits": [limit],
+            }
+        )
+        return record
+
+    if snap.get("signed_in"):
+        record["ready"] = True
+        record["hasLocalStats"] = True
+        record["usageStatusText"] = "Signed in — SuperGrok weekly quota not loaded yet"
+        record["authHelpText"] = "Run `grok login`, then refresh."
+        return record
+    if total_tokens > 0:
+        record.update(
+            {
+                "ready": True,
+                "hasLocalStats": True,
+                "usageStatusText": "Estimated from local Grok sessions",
+                "authHelpText": "Quota bar needs `grok login` for SuperGrok Chat + Grok Build.",
+            }
+        )
+        return record
+    record["usageStatusText"] = "SuperGrok usage not loaded"
+    record["authHelpText"] = (
+        "Run `grok login` on this laptop, then refresh SuperGrok usage."
+    )
+    return record
+
+
+def _usage_collect_cursor_local() -> dict:
+    record = _usage_base_record("cursor")
+    dbs = _usage_cursor_vscdb_paths()
+    if not dbs:
+        record["usageStatusText"] = "Cursor database not found"
+        record["authHelpText"] = (
+            "Sign in to Cursor on this laptop (~/.local/bin/cursor). "
+            "Looked under ~/.config/Cursor, ~/.config/cursor, ~/.cursor, and snap paths."
+        )
+        return record
+
+    today = _usage_today()
+    today_tokens = 0
+    total_tokens = 0
+    prompts = 0
+    model_usage: dict = {}
+    errors: list[str] = []
+
+    for db in dbs:
+        try:
+            t_day, t_total, t_prompts, t_models = _usage_scan_cursor_vscdb(db, today)
+        except Exception as exc:
+            errors.append(f"{db.name}: {exc}")
+            continue
+        today_tokens += t_day
+        total_tokens += t_total
+        prompts += t_prompts
+        for model, bucket in t_models.items():
+            merged = model_usage.setdefault(
+                model,
+                {
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 0,
+                },
+            )
+            for field in merged:
+                merged[field] += _usage_number(bucket.get(field))
+
+    if total_tokens > 0:
+        record.update(
+            {
+                "ready": True,
+                "hasLocalStats": True,
+                "usageStatusText": "Estimated from Cursor local state",
+                "authHelpText": f"Read {len(dbs)} local DB(s); see Cursor admin console for billing.",
+                "todayTotalTokens": today_tokens,
+                "todayPrompts": prompts,
+                "modelUsage": model_usage,
+            }
+        )
+    elif dbs:
+        record.update(
+            {
+                "ready": True,
+                "hasLocalStats": True,
+                "usageStatusText": "Signed in — no token totals in local state yet",
+                "authHelpText": (
+                    "Cursor local DB found; send a chat in the IDE, then refresh."
+                ),
+            }
+        )
+    else:
+        record["usageStatusText"] = "No Cursor token data in local state"
+        record["authHelpText"] = (
+            "Sign in to Cursor on this laptop and use the IDE, then refresh."
+            + (f" ({errors[-1]})" if errors else "")
+        )
+    return record
+
+
+def _usage_parse_reset_datetime(value: Any) -> time.struct_time | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.timetuple()
+    except ValueError:
+        pass
+    if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+        try:
+            return time.strptime(raw[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    return None
+
+
+def _usage_reset_caption(resets_at: Any) -> str:
+    reset = _usage_parse_reset_datetime(resets_at)
+    if reset is None:
+        return ""
+    now = time.localtime()
+    reset_day = time.mktime(
+        (reset.tm_year, reset.tm_mon, reset.tm_mday, 0, 0, 0, 0, 0, -1)
+    )
+    today = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, -1))
+    days_left = max(0, int(round((reset_day - today) / 86400)))
+    month_names = (
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sept", "Oct", "Nov", "Dec",
+    )
+    month = month_names[reset.tm_mon - 1]
+    day = str(reset.tm_mday)
+    if days_left == 0:
+        tail = "resets today"
+    elif days_left == 1:
+        tail = "1 day left"
+    else:
+        tail = f"{days_left} days left"
+    return f"Resets {day} {month} ({tail})"
+
+
+def _usage_limit_percent(limit: dict) -> float | None:
+    try:
+        percent = float(limit.get("percent"))
+    except (TypeError, ValueError):
+        return None
+    if percent != percent:
+        return None
+    if percent > 1:
+        percent /= 100.0
+    return min(1.0, max(0.0, percent))
+
+
+def _usage_panel_limit(
+    label: str,
+    percent: float | None,
+    *,
+    bar_style: str = "accent",
+    caption: str = "",
+    resets_at: Any = None,
+) -> dict:
+    entry: dict[str, Any] = {
+        "label": label,
+        "title": label,
+        "barStyle": bar_style,
+        "caption": caption,
+    }
+    if percent is not None:
+        entry["percent"] = percent
+    reset = str(resets_at or "").strip()
+    if reset:
+        entry["resetsAt"] = reset
+        reset_caption = _usage_reset_caption(reset)
+        if reset_caption:
+            entry["resetCaption"] = reset_caption
+    return entry
+
+
+def _usage_pick_limit(limits: list[dict], *needles: str) -> dict | None:
+    for entry in limits:
+        hay = " ".join(
+            str(entry.get(key) or "")
+            for key in ("label", "title", "kind", "period")
+        ).lower()
+        if any(needle in hay for needle in needles):
+            return entry
+    return None
+
+
+def _usage_cursor_panel_limits(limits: list[dict]) -> list[dict]:
+    cursor_entry = _usage_pick_limit(limits, "cursor model", "auto", "included")
+    other_entry = _usage_pick_limit(limits, "other model", "api")
+    if cursor_entry is None and limits:
+        cursor_entry = limits[0]
+    if other_entry is None and len(limits) > 1:
+        other_entry = limits[1]
+
+    rows: list[dict] = []
+    cursor_percent = _usage_limit_percent(cursor_entry) if cursor_entry else None
+    if cursor_entry is not None and cursor_percent is not None:
+        rows.append(
+            _usage_panel_limit(
+                "Cursor Models · Includes Cursor Grok and Composer",
+                cursor_percent,
+                bar_style="accent",
+                caption=(
+                    "Additional usage beyond limits consumes Other Models quota "
+                    "or on-demand spend."
+                ),
+                resets_at=cursor_entry.get("resetsAt"),
+            )
+        )
+    other_percent = _usage_limit_percent(other_entry) if other_entry else None
+    if other_entry is not None and other_percent is not None:
+        rows.append(
+            _usage_panel_limit(
+                "Other Models",
+                other_percent,
+                bar_style="muted",
+                caption="Additional usage beyond limits consumes on-demand spend.",
+                resets_at=other_entry.get("resetsAt"),
+            )
+        )
+    return rows
+
+
+def _usage_grokbot_panel_limits(limits: list[dict]) -> list[dict]:
+    weekly = _usage_pick_limit(limits, "week", "bot", "grok bot") or (limits[0] if limits else None)
+    if weekly is None:
+        return []
+    percent = _usage_limit_percent(weekly)
+    if percent is None:
+        return []
+    return [
+        _usage_panel_limit(
+            "Weekly usage",
+            percent,
+            bar_style="accent",
+            resets_at=weekly.get("resetsAt"),
+        )
+    ]
+
+
+def _usage_grok_build_panel_limits(limits: list[dict]) -> list[dict]:
+    build = (
+        _usage_pick_limit(limits, "usage", "week", "super")
+        or _usage_pick_limit(limits, "grok build", "build")
+        or (limits[0] if limits else None)
+    )
+    if build is None:
+        return []
+    percent = _usage_limit_percent(build)
+    if percent is None:
+        return []
+    label = str(build.get("title") or build.get("label") or "Usage").strip()
+    if label.lower().endswith(" limit"):
+        label = label[:-6].strip() or "Usage"
+    return [
+        _usage_panel_limit(
+            label,
+            percent,
+            bar_style="accent",
+            resets_at=build.get("resetsAt"),
+        )
+    ]
+
+
+def _usage_grokbot_overlay_limits() -> list[dict]:
+    overlay_path = Path.home() / ".config" / "omarchy" / "agents" / "grok.json"
+    if not overlay_path.is_file():
+        return []
+    try:
+        overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(overlay, dict):
+        return []
+    bot_pct = overlay.get("bot_pct")
+    if bot_pct is None:
+        return []
+    try:
+        percent = float(bot_pct)
+    except (TypeError, ValueError):
+        return []
+    if percent > 1:
+        percent /= 100.0
+    return [
+        _usage_panel_limit(
+            "Weekly usage",
+            min(1.0, max(0.0, percent)),
+            bar_style="accent",
+            resets_at=overlay.get("bot_reset_at"),
+        )
+    ]
+
+
+def _usage_panel_limits(agent_id: str, limits: list[dict]) -> list[dict]:
+    if agent_id == "cursor":
+        return _usage_cursor_panel_limits(limits)
+    if agent_id == "grokbot":
+        rows = _usage_grokbot_panel_limits(limits)
+        return rows if rows else _usage_grokbot_overlay_limits()
+    if agent_id == "grok":
+        return _usage_grok_build_panel_limits(limits)
+    return limits
+
+
+def _usage_normalize_auth_help(agent_id: str, record: dict) -> tuple[str, str]:
+    usage_status = str(record.get("usageStatusText") or "").strip()
+    auth_help = str(record.get("authHelpText") or "").strip()
+    if agent_id == "grokbot":
+        usage_status = _usage_sanitize_grokbot_text(usage_status)
+        auth_help = _usage_sanitize_grokbot_text(auth_help)
+    if auth_help.lower() == "initialize":
+        if agent_id == "grokbot":
+            auth_help = (
+                "Sign in to Grok Bot on this laptop, then refresh "
+                "(or `omarchy agent usage-update grokbot`)."
+            )
+        elif agent_id == "grok":
+            auth_help = "Run `grok login`, then refresh SuperGrok usage."
+        else:
+            auth_help = "Sign in to Cursor on this laptop, then refresh."
+    if agent_id == "grokbot" and "limits unavailable" in usage_status.lower():
+        if not auth_help or auth_help.lower() == "initialize":
+            auth_help = (
+                "Sign in to Grok Bot to refresh weekly limits; "
+                "local stats may still apply."
+            )
+    if agent_id == "grok" and "limits unavailable" in usage_status.lower():
+        if not auth_help or auth_help.lower() == "initialize":
+            auth_help = "Run `grok login` to refresh SuperGrok limits; local stats may still apply."
+    return usage_status, auth_help
+
+
+def _usage_panel_agent(agent_id: str, record: dict | None) -> dict:
+    if record is None:
+        status, help_text = USAGE_MISSING_HELP.get(
+            agent_id, ("No usage data yet", "Open the panel again to collect usage.")
+        )
+        if agent_id == "grokbot":
+            status = _usage_sanitize_grokbot_text(status)
+            help_text = _usage_sanitize_grokbot_text(help_text)
+        return {
+            "id": agent_id,
+            "name": AGENT_USAGE_NAMES.get(agent_id, agent_id),
+            "available": False,
+            "ready": False,
+            "tierLabel": "",
+            "usageStatusText": status,
+            "authHelpText": help_text,
+            "todayTotalTokens": 0,
+            "todayPrompts": 0,
+            "limits": [],
+            "updatedAt": _usage_now_iso(),
+        }
+
+    limits = record.get("limits") if isinstance(record.get("limits"), list) else []
+    panel_limits = _usage_panel_limits(agent_id, limits)
+    usage_status, auth_help = _usage_normalize_auth_help(agent_id, record)
+    ready = record.get("ready") is True
+    has_stats = record.get("hasLocalStats") is True or bool(record.get("modelUsage"))
+    has_tokens = _usage_number(record.get("todayTotalTokens")) > 0
+    has_prompts = _usage_number(record.get("todayPrompts")) > 0
+    has_limits = bool(panel_limits)
+    has_tier = bool(str(record.get("tierLabel") or "").strip())
+    available = ready or has_stats or has_limits or has_tier or has_tokens or has_prompts
+    return {
+        "id": agent_id,
+        "name": str(record.get("name") or AGENT_USAGE_NAMES.get(agent_id, agent_id)),
+        "available": available,
+        "ready": ready,
+        "tierLabel": str(record.get("tierLabel") or ""),
+        "usageStatusText": usage_status,
+        "authHelpText": auth_help,
+        "todayTotalTokens": _usage_number(record.get("todayTotalTokens")),
+        "todayPrompts": _usage_number(record.get("todayPrompts")),
+        "limits": panel_limits,
+        "updatedAt": str(record.get("updatedAt") or _usage_now_iso()),
+    }
+
+
+def cmd_ai_usage(refresh: bool = False) -> int:
+    missing = any(_usage_read_record(agent_id) is None for agent_id in AGENT_USAGE_IDS)
+    stale = any(_usage_record_is_stale(_usage_read_record(agent_id)) for agent_id in AGENT_USAGE_IDS)
+    if refresh:
+        cmd_ai_usage_update()
+        missing = any(_usage_read_record(agent_id) is None for agent_id in AGENT_USAGE_IDS)
+        stale = any(_usage_record_is_stale(_usage_read_record(agent_id)) for agent_id in AGENT_USAGE_IDS)
+    agents = [_usage_panel_agent(agent_id, _usage_read_record(agent_id)) for agent_id in AGENT_USAGE_IDS]
+    print(json.dumps(
+        {
+            "agents": agents,
+            "updatedAt": _usage_now_iso(),
+            "stale": bool(missing or stale),
+        },
+        separators=(",", ":"),
+    ))
+    return 0
+
+
+def cmd_ai_usage_update() -> int:
+    _ensure_usage_imports()
+    USAGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    omarchy_err = _usage_run_omarchy_update(("grokbot",))
+    if omarchy_err:
+        _usage_run_omarchy_update(("codex",))
+
+    grokbot_ok, grokbot_err = _usage_run_collector("grokbot")
+    collector_record = _usage_read_record("grokbot")
+    local_bot = _usage_collect_grokbot_local()
+    if isinstance(local_bot.get("limits"), list) and local_bot["limits"]:
+        _usage_write_record("grokbot", local_bot)
+    else:
+        merged = _usage_merge_records(collector_record, local_bot, agent_id="grokbot")
+        _usage_write_record("grokbot", merged)
+    if _usage_read_record("grokbot") is None:
+        record = _usage_base_record("grokbot")
+        record["usageStatusText"] = "Grok Bot usage unavailable"
+        hint = _usage_sanitize_grokbot_text(grokbot_err or omarchy_err or "")
+        record["authHelpText"] = (
+            "Sign in to Grok Bot on this laptop, then refresh "
+            "(or `omarchy agent usage-update grokbot`)."
+            + (f" ({hint})" if hint else "")
+        )
+        _usage_write_record("grokbot", record)
+
+    for agent_id, local_collector in (
+        ("cursor", _usage_collect_cursor_local),
+        ("grok", _usage_collect_grok_local),
+    ):
+        _usage_run_collector(agent_id)
+        collector_record = _usage_read_record(agent_id)
+        local_record = local_collector()
+        merged = _usage_merge_records(
+            collector_record,
+            local_record,
+            agent_id=agent_id,
+        )
+
+        if agent_id == "cursor":
+            live = _usage_fetch_cursor_live()
+            if live is not None:
+                live_limits = live.get("limits") if isinstance(live.get("limits"), list) else []
+                if live_limits:
+                    merged["limits"] = live_limits
+                    merged["ready"] = True
+                    if live.get("tierLabel"):
+                        merged["tierLabel"] = live["tierLabel"]
+                    merged["authHelpText"] = live.get("authHelpText") or ""
+                    merged["updatedAt"] = live.get("updatedAt") or merged.get("updatedAt")
+        elif agent_id == "grok":
+            live_limits = local_record.get("limits") if isinstance(local_record.get("limits"), list) else []
+            if live_limits:
+                merged["limits"] = live_limits
+                merged["ready"] = True
+                if local_record.get("tierLabel"):
+                    merged["tierLabel"] = local_record["tierLabel"]
+                merged["usageStatusText"] = local_record.get("usageStatusText") or ""
+                merged["authHelpText"] = local_record.get("authHelpText") or ""
+                merged["updatedAt"] = _usage_now_iso()
+
+        _usage_write_record(agent_id, merged)
+
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Omarchy Task Manager stats backend")
+    parser.add_argument("--version", action="version", version=APP_VERSION)
+    sub = parser.add_subparsers(dest="command")
+
+    snapshot_p = sub.add_parser("snapshot", help="Emit JSON stats snapshot")
+    snapshot_p.add_argument(
+        "--no-processes",
+        action="store_true",
+        help="Skip /proc process walk (compact panel)",
+    )
+    kill_p = sub.add_parser("kill", help="Terminate a process (SIGTERM then SIGKILL)")
+    kill_p.add_argument("pid", type=int)
+
+    sub.add_parser("prefs-get", help="Print prefs.json")
+    prefs_set = sub.add_parser("prefs-set", help="Update one prefs.json key")
+    prefs_set.add_argument("key")
+    prefs_set.add_argument("value")
+
+    sub.add_parser("autostart-get", help="Print autostart.lua enabled state")
+    autostart_set = sub.add_parser("autostart-set", help="Enable/disable Hyprland autostart block")
+    autostart_set.add_argument("value")
+
+    ai_usage = sub.add_parser(
+        "ai-usage",
+        help="Emit aggregated AI usage JSON for Cursor, Grok Bot, and SuperGrok",
+    )
+    ai_usage.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Run ai-usage-update before reading state files",
+    )
+    sub.add_parser("ai-usage-update", help="Refresh AI usage state files")
+
+    args = parser.parse_args(argv)
+    if args.command == "snapshot":
+        return cmd_snapshot(include_processes=not args.no_processes)
+    if args.command == "kill":
+        return cmd_kill(args.pid)
+    if args.command == "prefs-get":
+        return cmd_prefs_get()
+    if args.command == "prefs-set":
+        return cmd_prefs_set(args.key, args.value)
+    if args.command == "autostart-get":
+        return cmd_autostart_get()
+    if args.command == "autostart-set":
+        return cmd_autostart_set(args.value)
+    if args.command == "ai-usage":
+        return cmd_ai_usage(refresh=args.refresh)
+    if args.command == "ai-usage-update":
+        return cmd_ai_usage_update()
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

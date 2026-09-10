@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "sw.art.task-manager",
+  "name": "Task Manager",
+    "version": "0.5.5-44",
+  "author": "Toby Swart",
+  "license": "MIT",
+  "description": "CPU, GPU, RAM, fans, and a process table in an Omarchy bar popout",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Task Manager",
+    "description": "Open the Task Manager KeyboardPanel from the bar icon",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
