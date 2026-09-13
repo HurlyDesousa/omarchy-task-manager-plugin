@@ -3,7 +3,7 @@
   "id": "sw.art.task-manager",
   "name": "Task Manager",
     "version": "0.5.5-44",
-  "author": "Toby Swart",
+  "author": "Hurly Swart",
   "license": "MIT",
   "description": "CPU, GPU, RAM, fans, and a process table in an Omarchy bar popout",
   "kinds": [
