@@ -2,6 +2,8 @@
 
 CPU, GPU, RAM, thermals, fan meters, and a process table in an Omarchy bar popout.
 
+![Task Manager compact view](preview.png)
+
 Plugin id: `sw.art.task-manager`
 
 ## Install
