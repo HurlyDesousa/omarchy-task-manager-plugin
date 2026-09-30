@@ -33,13 +33,6 @@ FAN_RPM_MAX = 8000
 STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "task-manager"
 PREFS_FILE = STATE_DIR / "prefs.json"
 STATS_STATE_FILE = STATE_DIR / "stats-state.json"
-
-APP_BINARY = str(Path.home() / ".local" / "bin" / "omarchy-task-manager")
-AUTOSTART_LUA = Path.home() / ".config" / "hypr" / "autostart.lua"
-AUTOSTART_BLOCK_BEGIN = "-- omarchy-task-manager begin"
-AUTOSTART_BLOCK_END = "-- omarchy-task-manager end"
-APP_ID = "art.sw.omarchy.TaskManager"
-
 DEFAULT_PREFS: dict = {
     "start_compact": False,
     "remember_expand": True,
@@ -90,64 +83,6 @@ def save_stats_state(state: dict) -> None:
         STATS_STATE_FILE.write_text(json.dumps(state) + "\n", encoding="utf-8")
     except Exception:
         pass
-
-
-def _read_autostart_enabled() -> bool:
-    try:
-        text = AUTOSTART_LUA.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    i_begin = text.find(AUTOSTART_BLOCK_BEGIN)
-    if i_begin < 0:
-        return False
-    i_end = text.find(AUTOSTART_BLOCK_END, i_begin)
-    if i_end < 0:
-        return False
-    block = text[i_begin:i_end]
-    return bool(re.search(r"o\.launch_on_start\s*\(", block))
-
-
-def _set_autostart(enabled: bool) -> str:
-    try:
-        try:
-            text = AUTOSTART_LUA.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            text = "-- Extra autostart processes.\n"
-
-        i_begin = text.find(AUTOSTART_BLOCK_BEGIN)
-        i_end = text.find(AUTOSTART_BLOCK_END, i_begin) if i_begin >= 0 else -1
-        has_block = i_begin >= 0 and i_end >= 0
-
-        if enabled:
-            launch_line = f'o.launch_on_start("{APP_BINARY}")'
-            window_line = f'o.window("{APP_ID}", {{ float = true }})'
-            new_block = (
-                f"{AUTOSTART_BLOCK_BEGIN}\n"
-                f"{launch_line}\n"
-                f"{window_line}\n"
-                f"{AUTOSTART_BLOCK_END}\n"
-            )
-            if has_block:
-                block_inner = text[i_begin + len(AUTOSTART_BLOCK_BEGIN) : i_end]
-                _window_re = re.compile(
-                    r'o\.window\s*\(\s*["\']' + re.escape(APP_ID) + r'["\']'
-                )
-                if (
-                    re.search(r"o\.launch_on_start\s*\(", block_inner)
-                    and _window_re.search(block_inner)
-                ):
-                    return ""
-                text = text[:i_begin] + new_block + text[i_end + len(AUTOSTART_BLOCK_END) + 1 :]
-            else:
-                text = text.rstrip() + "\n\n" + new_block
-        elif has_block:
-            text = text[:i_begin] + text[i_end + len(AUTOSTART_BLOCK_END) + 1 :]
-
-        AUTOSTART_LUA.parent.mkdir(parents=True, exist_ok=True)
-        AUTOSTART_LUA.write_text(text, encoding="utf-8")
-        return ""
-    except Exception as exc:
-        return str(exc)
 
 
 def cpu_pct(prev: tuple[int, int] | None, cur: tuple[int, int]) -> float:
@@ -668,20 +603,6 @@ def cmd_prefs_set(key: str, value: str) -> int:
     return 0
 
 
-def cmd_autostart_get() -> int:
-    print("true" if _read_autostart_enabled() else "false")
-    return 0
-
-
-def cmd_autostart_set(value: str) -> int:
-    enabled = value.lower() in ("1", "true", "yes", "on")
-    err = _set_autostart(enabled)
-    if err:
-        print(err, file=sys.stderr)
-        return 1
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Omarchy Task Manager stats backend")
     parser.add_argument("--version", action="version", version=APP_VERSION)
@@ -701,10 +622,6 @@ def main(argv: list[str] | None = None) -> int:
     prefs_set.add_argument("key")
     prefs_set.add_argument("value")
 
-    sub.add_parser("autostart-get", help="Print autostart.lua enabled state")
-    autostart_set = sub.add_parser("autostart-set", help="Enable/disable Hyprland autostart block")
-    autostart_set.add_argument("value")
-
     args = parser.parse_args(argv)
     if args.command == "snapshot":
         return cmd_snapshot(include_processes=not args.no_processes)
@@ -714,10 +631,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_prefs_get()
     if args.command == "prefs-set":
         return cmd_prefs_set(args.key, args.value)
-    if args.command == "autostart-get":
-        return cmd_autostart_get()
-    if args.command == "autostart-set":
-        return cmd_autostart_set(args.value)
 
     parser.print_help()
     return 2
