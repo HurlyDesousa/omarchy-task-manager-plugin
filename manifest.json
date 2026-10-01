@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "sw.art.task-manager",
   "name": "Task Manager",
-  "version": "0.5.5-45",
+  "version": "0.5.5-46",
   "author": "Hurly Swart",
   "license": "MIT",
   "description": "CPU, GPU, RAM, fans, and a process table in an Omarchy bar popout",

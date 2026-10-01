@@ -21,6 +21,9 @@ Panel {
     property bool expanded: false
     property string filterText: ""
     property int selectedPid: -1
+    // With the PID, the start time names one process instance; the helper
+    // refuses to signal a PID that has since been reused.
+    property real selectedStart: -1
     property var snapshot: ({})
     property var prefs: ({})
     property var processModel: []
@@ -335,7 +338,7 @@ Panel {
                         }
 
                         Label {
-                            text: "Version 0.5.5-45"
+                            text: "Version 0.5.5-46"
                             color: Qt.darker(root.bar.foreground, 1.5)
                             font.family: root.bar.fontFamily
                             font.pixelSize: Style.font.bodySmall
@@ -557,10 +560,12 @@ Panel {
                                             onClicked: {
                                                 procList.currentIndex = index
                                                 root.selectedPid = modelData.pid
+                                                root.selectedStart = modelData.starttime
                                             }
                                             onDoubleClicked: {
                                                 procList.currentIndex = index
                                                 root.selectedPid = modelData.pid
+                                                root.selectedStart = modelData.starttime
                                             }
                                         }
                                     }
@@ -589,9 +594,11 @@ Panel {
                                             enabled: root.selectedPid > 0
                                             cursorShape: Qt.PointingHandCursor
                                             onClicked: {
-                                                killProc.command = [root.taskManagerBin, "kill", String(root.selectedPid)]
+                                                killProc.command = [root.taskManagerBin, "kill",
+                                                    String(root.selectedPid), String(root.selectedStart)]
                                                 killProc.running = true
                                                 root.selectedPid = -1
+                                                root.selectedStart = -1
                                                 procList.currentIndex = -1
                                             }
                                         }

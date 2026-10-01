@@ -7,14 +7,14 @@ import argparse
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
-APP_VERSION = "0.5.5-45"
+APP_VERSION = "0.5.5-46"
 EM_DASH = "\u2014"
 
 PREFERRED_THERMAL = (
@@ -432,29 +432,41 @@ def pid_alive(pid: int, starttime: int | None = None) -> bool:
         return False
 
 
-def kill_process(pid: int) -> tuple[bool, str]:
+def kill_process(pid: int, starttime: int) -> tuple[bool, str]:
+    """End the process the panel showed, never whoever holds its PID now.
+
+    The pidfd pins one process instance. Checking the start time after
+    opening it proves the pinned process is the selected one, and both
+    signals go through the pidfd, so a reused PID never receives them.
+    """
     try:
-        os.kill(pid, signal.SIGTERM)
+        pidfd = os.pidfd_open(pid)
     except ProcessLookupError:
         return False, "Process not found"
-    except PermissionError:
-        return False, "Permission denied"
     except OSError as exc:
-        return False, str(exc)
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        if not pid_alive(pid):
-            return True, ""
-        time.sleep(0.1)
+        return False, f"Cannot pin the process: {exc}"
     try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
+        if not pid_alive(pid, starttime):
+            return False, "Process has already exited"
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            return True, ""
+        except PermissionError:
+            return False, "Permission denied"
+        exited = select.poll()
+        exited.register(pidfd, select.POLLIN)
+        if exited.poll(2000):
+            return True, ""
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        except ProcessLookupError:
+            return True, ""
+        except PermissionError:
+            return False, "Permission denied — could not SIGKILL"
         return True, ""
-    except PermissionError:
-        return False, "Permission denied — could not SIGKILL"
-    except OSError as exc:
-        return False, str(exc)
-    return True, ""
+    finally:
+        os.close(pidfd)
 
 
 def build_snapshot(*, include_processes: bool = True) -> dict:
@@ -570,8 +582,8 @@ def cmd_snapshot(*, include_processes: bool = True) -> int:
     return 0
 
 
-def cmd_kill(pid: int) -> int:
-    ok, err = kill_process(pid)
+def cmd_kill(pid: int, starttime: int) -> int:
+    ok, err = kill_process(pid, starttime)
     if ok:
         return 0
     print(err, file=sys.stderr)
@@ -616,6 +628,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     kill_p = sub.add_parser("kill", help="Terminate a process (SIGTERM then SIGKILL)")
     kill_p.add_argument("pid", type=int)
+    kill_p.add_argument(
+        "starttime",
+        type=int,
+        help="Start time from the snapshot; refused if the PID now names another process",
+    )
 
     sub.add_parser("prefs-get", help="Print prefs.json")
     prefs_set = sub.add_parser("prefs-set", help="Update one prefs.json key")
@@ -626,7 +643,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "snapshot":
         return cmd_snapshot(include_processes=not args.no_processes)
     if args.command == "kill":
-        return cmd_kill(args.pid)
+        return cmd_kill(args.pid, args.starttime)
     if args.command == "prefs-get":
         return cmd_prefs_get()
     if args.command == "prefs-set":
